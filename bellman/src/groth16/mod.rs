@@ -24,11 +24,12 @@ pub struct Proof<E: Engine> {
     pub a: E::G1Affine,
     pub b: E::G2Affine,
     pub c: E::G1Affine,
+    pub d: Option<E::G1Affine>,
 }
 
 impl<E: Engine> PartialEq for Proof<E> {
     fn eq(&self, other: &Self) -> bool {
-        self.a == other.a && self.b == other.b && self.c == other.c
+        self.a == other.a && self.b == other.b && self.c == other.c && self.d == self.d
     }
 }
 
@@ -37,6 +38,12 @@ impl<E: Engine> Proof<E> {
         writer.write_all(self.a.into_compressed().as_ref())?;
         writer.write_all(self.b.into_compressed().as_ref())?;
         writer.write_all(self.c.into_compressed().as_ref())?;
+        if let Some(ref d) = self.d {
+            writer.write_u8(0x01)?;
+            writer.write_all(d.into_compressed().as_ref())?;
+        } else {
+            writer.write_u8(0x00)?;
+        }
 
         Ok(())
     }
@@ -90,7 +97,33 @@ impl<E: Engine> Proof<E> {
                 }
             })?;
 
-        Ok(Proof { a, b, c })
+        let d_flag = reader.read_u8()?;
+        let d = match d_flag {
+            0x00 => None,
+            0x01 => {
+                reader.read_exact(g1_repr.as_mut())?;
+                let d = g1_repr
+                    .into_affine()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                    .and_then(|e| {
+                        if e.is_zero() {
+                            Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "point at infinity",
+                            ))
+                        } else {
+                            Ok(e)
+                        }
+                    })?;
+                Some(d)
+            },
+            _ => return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "d flag has unexpected value",
+            )),
+        };
+
+        Ok(Proof { a, b, c, d })
     }
 }
 
@@ -115,6 +148,13 @@ pub struct VerifyingKey<E: Engine> {
     pub delta_g1: E::G1Affine,
     pub delta_g2: E::G2Affine,
 
+    // theta in g1/g2 for verifying and proving, essentially the magic
+    // trapdoor that forces the prover to evaluate the D element of the
+    // proof with only components from the CRS. Never the point at
+    // infinity.
+    pub theta_g1: E::G1Affine,
+    pub theta_g2: E::G2Affine,
+
     // Elements of the form (beta * u_i(tau) + alpha v_i(tau) + w_i(tau)) / gamma
     // for all public inputs. Because all public inputs have a dummy constraint,
     // this is the same size as the number of inputs, and never contains points
@@ -130,6 +170,8 @@ impl<E: Engine> PartialEq for VerifyingKey<E> {
             && self.gamma_g2 == other.gamma_g2
             && self.delta_g1 == other.delta_g1
             && self.delta_g2 == other.delta_g2
+            && self.theta_g1 == other.theta_g1
+            && self.theta_g2 == other.theta_g2
             && self.ic == other.ic
     }
 }
@@ -142,6 +184,8 @@ impl<E: Engine> VerifyingKey<E> {
         writer.write_all(self.gamma_g2.into_uncompressed().as_ref())?;
         writer.write_all(self.delta_g1.into_uncompressed().as_ref())?;
         writer.write_all(self.delta_g2.into_uncompressed().as_ref())?;
+        writer.write_all(self.theta_g1.into_uncompressed().as_ref())?;
+        writer.write_all(self.theta_g2.into_uncompressed().as_ref())?;
         writer.write_u32::<BigEndian>(self.ic.len() as u32)?;
         for ic in &self.ic {
             writer.write_all(ic.into_uncompressed().as_ref())?;
@@ -184,6 +228,16 @@ impl<E: Engine> VerifyingKey<E> {
             .into_affine()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+        reader.read_exact(g1_repr.as_mut())?;
+        let theta_g1 = g1_repr
+            .into_affine()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        reader.read_exact(g2_repr.as_mut())?;
+        let theta_g2 = g2_repr
+            .into_affine()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
         let ic_len = reader.read_u32::<BigEndian>()? as usize;
 
         let mut ic = vec![];
@@ -214,6 +268,8 @@ impl<E: Engine> VerifyingKey<E> {
             gamma_g2,
             delta_g1,
             delta_g2,
+            theta_g1,
+            theta_g2,
             ic,
         })
     }
@@ -226,6 +282,11 @@ pub struct Parameters<E: Engine> {
     // Elements of the form ((tau^i * t(tau)) / delta) for i between 0 and
     // m-2 inclusive. Never contains points at infinity.
     pub h: Arc<Vec<E::G1Affine>>,
+
+    // Elements of the form (beta * u_i(tau) + alpha v_i(tau) + w_i(tau)) / theta
+    // for all auxiliary inputs. Variables can never be unconstrained, so this
+    // never contains points at infinity.
+    pub k: Arc<Vec<E::G1Affine>>,
 
     // Elements of the form (beta * u_i(tau) + alpha v_i(tau) + w_i(tau)) / delta
     // for all auxiliary inputs. Variables can never be unconstrained, so this
@@ -248,6 +309,7 @@ impl<E: Engine> PartialEq for Parameters<E> {
     fn eq(&self, other: &Self) -> bool {
         self.vk == other.vk
             && self.h == other.h
+            && self.k == other.k
             && self.l == other.l
             && self.a == other.a
             && self.b_g1 == other.b_g1
@@ -261,6 +323,11 @@ impl<E: Engine> Parameters<E> {
 
         writer.write_u32::<BigEndian>(self.h.len() as u32)?;
         for g in &self.h[..] {
+            writer.write_all(g.into_uncompressed().as_ref())?;
+        }
+
+        writer.write_u32::<BigEndian>(self.k.len() as u32)?;
+        for g in &self.k[..] {
             writer.write_all(g.into_uncompressed().as_ref())?;
         }
 
@@ -335,6 +402,7 @@ impl<E: Engine> Parameters<E> {
         let vk = VerifyingKey::<E>::read(&mut reader)?;
 
         let mut h = vec![];
+        let mut k = vec![];
         let mut l = vec![];
         let mut a = vec![];
         let mut b_g1 = vec![];
@@ -344,6 +412,13 @@ impl<E: Engine> Parameters<E> {
             let len = reader.read_u32::<BigEndian>()? as usize;
             for _ in 0..len {
                 h.push(read_g1(&mut reader)?);
+            }
+        }
+
+        {
+            let len = reader.read_u32::<BigEndian>()? as usize;
+            for _ in 0..len {
+                k.push(read_g1(&mut reader)?);
             }
         }
 
@@ -378,6 +453,7 @@ impl<E: Engine> Parameters<E> {
         Ok(Parameters {
             vk,
             h: Arc::new(h),
+            k: Arc::new(k),
             l: Arc::new(l),
             a: Arc::new(a),
             b_g1: Arc::new(b_g1),
@@ -393,6 +469,8 @@ pub struct PreparedVerifyingKey<E: Engine> {
     neg_gamma_g2: <E::G2Affine as PairingCurveAffine>::Prepared,
     /// -delta in G2
     neg_delta_g2: <E::G2Affine as PairingCurveAffine>::Prepared,
+    /// -theta in G2
+    neg_theta_g2: <E::G2Affine as PairingCurveAffine>::Prepared,
     /// Copy of IC from `VerifiyingKey`.
     ic: Vec<E::G1Affine>,
 }
@@ -403,22 +481,26 @@ pub trait ParameterSource<E: Engine> {
 
     fn get_vk(&mut self, num_ic: usize) -> Result<VerifyingKey<E>, SynthesisError>;
     fn get_h(&mut self, num_h: usize) -> Result<Self::G1Builder, SynthesisError>;
+    fn get_k(&mut self, num_k: usize) -> Result<Self::G1Builder, SynthesisError>;
     fn get_l(&mut self, num_l: usize) -> Result<Self::G1Builder, SynthesisError>;
     fn get_a(
         &mut self,
         num_inputs: usize,
+        num_hybrid: usize,
         num_aux: usize,
-    ) -> Result<(Self::G1Builder, Self::G1Builder), SynthesisError>;
+    ) -> Result<(Self::G1Builder, Self::G1Builder, Self::G1Builder), SynthesisError>;
     fn get_b_g1(
         &mut self,
         num_inputs: usize,
+        num_hybrid: usize,
         num_aux: usize,
-    ) -> Result<(Self::G1Builder, Self::G1Builder), SynthesisError>;
+    ) -> Result<(Self::G1Builder, Self::G1Builder, Self::G1Builder), SynthesisError>;
     fn get_b_g2(
         &mut self,
         num_inputs: usize,
+        num_hybrid: usize,
         num_aux: usize,
-    ) -> Result<(Self::G2Builder, Self::G2Builder), SynthesisError>;
+    ) -> Result<(Self::G2Builder, Self::G2Builder, Self::G2Builder), SynthesisError>;
 }
 
 impl<'a, E: Engine> ParameterSource<E> for &'a Parameters<E> {
@@ -433,6 +515,10 @@ impl<'a, E: Engine> ParameterSource<E> for &'a Parameters<E> {
         Ok((self.h.clone(), 0))
     }
 
+    fn get_k(&mut self, _: usize) -> Result<Self::G1Builder, SynthesisError> {
+        Ok((self.k.clone(), 0))
+    }
+
     fn get_l(&mut self, _: usize) -> Result<Self::G1Builder, SynthesisError> {
         Ok((self.l.clone(), 0))
     }
@@ -440,25 +526,40 @@ impl<'a, E: Engine> ParameterSource<E> for &'a Parameters<E> {
     fn get_a(
         &mut self,
         num_inputs: usize,
+        num_hybrid: usize,
         _: usize,
-    ) -> Result<(Self::G1Builder, Self::G1Builder), SynthesisError> {
-        Ok(((self.a.clone(), 0), (self.a.clone(), num_inputs)))
+    ) -> Result<(Self::G1Builder, Self::G1Builder, Self::G1Builder), SynthesisError> {
+        Ok((
+            (self.a.clone(), 0),
+            (self.a.clone(), num_inputs),
+            (self.a.clone(), num_inputs + num_hybrid),
+        ))
     }
 
     fn get_b_g1(
         &mut self,
         num_inputs: usize,
+        num_hybrid: usize,
         _: usize,
-    ) -> Result<(Self::G1Builder, Self::G1Builder), SynthesisError> {
-        Ok(((self.b_g1.clone(), 0), (self.b_g1.clone(), num_inputs)))
+    ) -> Result<(Self::G1Builder, Self::G1Builder, Self::G1Builder), SynthesisError> {
+        Ok((
+            (self.b_g1.clone(), 0),
+            (self.b_g1.clone(), num_inputs),
+            (self.b_g1.clone(), num_inputs + num_hybrid),
+        ))
     }
 
     fn get_b_g2(
         &mut self,
         num_inputs: usize,
+        num_hybrid: usize,
         _: usize,
-    ) -> Result<(Self::G2Builder, Self::G2Builder), SynthesisError> {
-        Ok(((self.b_g2.clone(), 0), (self.b_g2.clone(), num_inputs)))
+    ) -> Result<(Self::G2Builder, Self::G2Builder, Self::G2Builder), SynthesisError> {
+        Ok((
+            (self.b_g2.clone(), 0),
+            (self.b_g2.clone(), num_inputs),
+            (self.b_g2.clone(), num_inputs + num_hybrid),
+        ))
     }
 }
 
@@ -512,7 +613,7 @@ mod test_with_bls12_381 {
             let mut v = vec![];
 
             params.write(&mut v).unwrap();
-            assert_eq!(v.len(), 2136);
+            assert_eq!(v.len(), 2428);
 
             let de_params = Parameters::read(&v[..], true).unwrap();
             assert!(params == de_params);
@@ -535,6 +636,7 @@ mod test_with_bls12_381 {
                     b: Some(b),
                 },
                 &params,
+                None,
                 rng,
             )
             .unwrap();
@@ -542,7 +644,7 @@ mod test_with_bls12_381 {
             let mut v = vec![];
             proof.write(&mut v).unwrap();
 
-            assert_eq!(v.len(), 192);
+            assert_eq!(v.len(), 240);
 
             let de_proof = Proof::read(&v[..]).unwrap();
             assert!(proof == de_proof);

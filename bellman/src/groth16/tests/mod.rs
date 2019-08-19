@@ -96,6 +96,7 @@ fn test_xordemo() {
     let beta = Fr::from_str("22580").unwrap();
     let gamma = Fr::from_str("53332").unwrap();
     let delta = Fr::from_str("5481").unwrap();
+    let theta = Fr::from_str("84038").unwrap();
     let tau = Fr::from_str("3673").unwrap();
 
     let params = {
@@ -105,7 +106,7 @@ fn test_xordemo() {
             _marker: PhantomData,
         };
 
-        generate_parameters(c, g1, g2, alpha, beta, gamma, delta, tau).unwrap()
+        generate_parameters(c, g1, g2, alpha, beta, gamma, delta, theta, tau).unwrap()
     };
 
     // This will synthesize the constraint system:
@@ -174,6 +175,9 @@ fn test_xordemo() {
 
     // The density of the IC query is 2 (2 inputs)
     assert_eq!(2, params.vk.ic.len());
+
+    // The density of the K query is 0 (0 hybrid variables)
+    assert_eq!(2, params.l.len());
 
     // The density of the L query is 2 (2 aux variables)
     assert_eq!(2, params.l.len());
@@ -279,6 +283,7 @@ fn test_xordemo() {
 
     let pvk = prepare_verifying_key(&params.vk);
 
+    let q = Fr::from_str("22152").unwrap();
     let r = Fr::from_str("27134").unwrap();
     let s = Fr::from_str("17146").unwrap();
 
@@ -289,7 +294,7 @@ fn test_xordemo() {
             _marker: PhantomData,
         };
 
-        create_proof(c, &params, r, s).unwrap()
+        create_proof(c, &params, q, r, s).unwrap()
     };
 
     // A(x) =
@@ -356,6 +361,11 @@ fn test_xordemo() {
         let mut tmp = delta;
         tmp.mul_assign(&r);
         tmp.mul_assign(&s);
+        expected_c.sub_assign(&tmp);
+
+        // theta * q
+        let mut tmp = theta;
+        tmp.mul_assign(&q);
         expected_c.sub_assign(&tmp);
 
         // L query answer

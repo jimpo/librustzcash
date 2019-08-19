@@ -203,7 +203,7 @@ fn test_mimc() {
             };
 
             // Create a groth16 proof with our parameters.
-            let proof = create_random_proof(c, &params, rng).unwrap();
+            let proof = create_random_proof(c, &params, None, rng).unwrap();
 
             proof.write(&mut proof_vec).unwrap();
         }

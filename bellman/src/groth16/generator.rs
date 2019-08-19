@@ -31,20 +31,25 @@ where
     let beta = E::Fr::random(rng);
     let gamma = E::Fr::random(rng);
     let delta = E::Fr::random(rng);
+    let theta = E::Fr::random(rng);
     let tau = E::Fr::random(rng);
 
-    generate_parameters::<E, C>(circuit, g1, g2, alpha, beta, gamma, delta, tau)
+    generate_parameters::<E, C>(circuit, g1, g2, alpha, beta, gamma, delta, theta, tau)
 }
 
 /// This is our assembly structure that we'll use to synthesize the
 /// circuit into a QAP.
 struct KeypairAssembly<E: Engine> {
     num_inputs: usize,
+    num_hybrid: usize,
     num_aux: usize,
     num_constraints: usize,
     at_inputs: Vec<Vec<(E::Fr, usize)>>,
     bt_inputs: Vec<Vec<(E::Fr, usize)>>,
     ct_inputs: Vec<Vec<(E::Fr, usize)>>,
+    at_hybrid: Vec<Vec<(E::Fr, usize)>>,
+    bt_hybrid: Vec<Vec<(E::Fr, usize)>>,
+    ct_hybrid: Vec<Vec<(E::Fr, usize)>>,
     at_aux: Vec<Vec<(E::Fr, usize)>>,
     bt_aux: Vec<Vec<(E::Fr, usize)>>,
     ct_aux: Vec<Vec<(E::Fr, usize)>>,
@@ -70,6 +75,25 @@ impl<E: Engine> ConstraintSystem<E> for KeypairAssembly<E> {
         self.ct_aux.push(vec![]);
 
         Ok(Variable(Index::Aux(index)))
+    }
+
+    fn alloc_hybrid<F, A, AR>(&mut self, _: A, _: F) -> Result<Variable, SynthesisError>
+        where
+            F: FnOnce() -> Result<E::Fr, SynthesisError>,
+            A: FnOnce() -> AR,
+            AR: Into<String>,
+    {
+        // There is no assignment, so we don't even invoke the
+        // function for obtaining one.
+
+        let index = self.num_hybrid;
+        self.num_hybrid += 1;
+
+        self.at_hybrid.push(vec![]);
+        self.bt_hybrid.push(vec![]);
+        self.ct_hybrid.push(vec![]);
+
+        Ok(Variable(Index::Hybrid(index)))
     }
 
     fn alloc_input<F, A, AR>(&mut self, _: A, _: F) -> Result<Variable, SynthesisError>
@@ -102,12 +126,14 @@ impl<E: Engine> ConstraintSystem<E> for KeypairAssembly<E> {
         fn eval<E: Engine>(
             l: LinearCombination<E>,
             inputs: &mut [Vec<(E::Fr, usize)>],
+            hybrid: &mut [Vec<(E::Fr, usize)>],
             aux: &mut [Vec<(E::Fr, usize)>],
             this_constraint: usize,
         ) {
             for (index, coeff) in l.0 {
                 match index {
                     Variable(Index::Input(id)) => inputs[id].push((coeff, this_constraint)),
+                    Variable(Index::Hybrid(id)) => hybrid[id].push((coeff, this_constraint)),
                     Variable(Index::Aux(id)) => aux[id].push((coeff, this_constraint)),
                 }
             }
@@ -116,18 +142,21 @@ impl<E: Engine> ConstraintSystem<E> for KeypairAssembly<E> {
         eval(
             a(LinearCombination::zero()),
             &mut self.at_inputs,
+            &mut self.at_hybrid,
             &mut self.at_aux,
             self.num_constraints,
         );
         eval(
             b(LinearCombination::zero()),
             &mut self.bt_inputs,
+            &mut self.bt_hybrid,
             &mut self.bt_aux,
             self.num_constraints,
         );
         eval(
             c(LinearCombination::zero()),
             &mut self.ct_inputs,
+            &mut self.ct_hybrid,
             &mut self.ct_aux,
             self.num_constraints,
         );
@@ -161,6 +190,7 @@ pub fn generate_parameters<E, C>(
     beta: E::Fr,
     gamma: E::Fr,
     delta: E::Fr,
+    theta: E::Fr,
     tau: E::Fr,
 ) -> Result<Parameters<E>, SynthesisError>
 where
@@ -169,11 +199,15 @@ where
 {
     let mut assembly = KeypairAssembly {
         num_inputs: 0,
+        num_hybrid: 0,
         num_aux: 0,
         num_constraints: 0,
         at_inputs: vec![],
         bt_inputs: vec![],
         ct_inputs: vec![],
+        at_hybrid: vec![],
+        bt_hybrid: vec![],
+        ct_hybrid: vec![],
         at_aux: vec![],
         bt_aux: vec![],
         ct_aux: vec![],
@@ -200,23 +234,24 @@ where
     let g1_wnaf = g1_wnaf.base(g1, {
         // H query
         (powers_of_tau.as_ref().len() - 1)
-        // IC/L queries
-        + assembly.num_inputs + assembly.num_aux
+        // IC/L/K queries
+        + assembly.num_inputs + assembly.num_hybrid + assembly.num_aux
         // A query
-        + assembly.num_inputs + assembly.num_aux
+        + assembly.num_inputs + assembly.num_hybrid + assembly.num_aux
         // B query
-        + assembly.num_inputs + assembly.num_aux
+        + assembly.num_inputs + assembly.num_hybrid + assembly.num_aux
     });
 
     // Compute G2 window table
     let mut g2_wnaf = Wnaf::new();
     let g2_wnaf = g2_wnaf.base(g2, {
         // B query
-        assembly.num_inputs + assembly.num_aux
+        assembly.num_inputs + assembly.num_hybrid + assembly.num_aux
     });
 
     let gamma_inverse = gamma.inverse().ok_or(SynthesisError::UnexpectedIdentity)?;
     let delta_inverse = delta.inverse().ok_or(SynthesisError::UnexpectedIdentity)?;
+    let theta_inverse = theta.inverse().ok_or(SynthesisError::UnexpectedIdentity)?;
 
     let worker = Worker::new();
 
@@ -273,10 +308,11 @@ where
     powers_of_tau.ifft(&worker);
     let powers_of_tau = powers_of_tau.into_coeffs();
 
-    let mut a = vec![E::G1::zero(); assembly.num_inputs + assembly.num_aux];
-    let mut b_g1 = vec![E::G1::zero(); assembly.num_inputs + assembly.num_aux];
-    let mut b_g2 = vec![E::G2::zero(); assembly.num_inputs + assembly.num_aux];
+    let mut a = vec![E::G1::zero(); assembly.num_inputs + assembly.num_hybrid + assembly.num_aux];
+    let mut b_g1 = vec![E::G1::zero(); assembly.num_inputs + assembly.num_hybrid + assembly.num_aux];
+    let mut b_g2 = vec![E::G2::zero(); assembly.num_inputs + assembly.num_hybrid + assembly.num_aux];
     let mut ic = vec![E::G1::zero(); assembly.num_inputs];
+    let mut k = vec![E::G1::zero(); assembly.num_hybrid];
     let mut l = vec![E::G1::zero(); assembly.num_aux];
 
     fn eval<E: Engine>(
@@ -411,6 +447,24 @@ where
         &worker,
     );
 
+    // Evaluate for hybrid variables.
+    eval(
+        &g1_wnaf,
+        &g2_wnaf,
+        &powers_of_tau,
+        &assembly.at_hybrid,
+        &assembly.bt_hybrid,
+        &assembly.ct_hybrid,
+        &mut a[assembly.num_inputs..(assembly.num_inputs + assembly.num_hybrid)],
+        &mut b_g1[assembly.num_inputs..(assembly.num_inputs + assembly.num_hybrid)],
+        &mut b_g2[assembly.num_inputs..(assembly.num_inputs + assembly.num_hybrid)],
+        &mut k,
+        &theta_inverse,
+        &alpha,
+        &beta,
+        &worker,
+    );
+
     // Evaluate for auxiliary variables.
     eval(
         &g1_wnaf,
@@ -419,9 +473,9 @@ where
         &assembly.at_aux,
         &assembly.bt_aux,
         &assembly.ct_aux,
-        &mut a[assembly.num_inputs..],
-        &mut b_g1[assembly.num_inputs..],
-        &mut b_g2[assembly.num_inputs..],
+        &mut a[(assembly.num_inputs + assembly.num_hybrid)..],
+        &mut b_g1[(assembly.num_inputs + assembly.num_hybrid)..],
+        &mut b_g2[(assembly.num_inputs + assembly.num_hybrid)..],
         &mut l,
         &delta_inverse,
         &alpha,
@@ -447,12 +501,15 @@ where
         gamma_g2: g2.mul(gamma).into_affine(),
         delta_g1: g1.mul(delta).into_affine(),
         delta_g2: g2.mul(delta).into_affine(),
+        theta_g1: g1.mul(theta).into_affine(),
+        theta_g2: g2.mul(theta).into_affine(),
         ic: ic.into_iter().map(|e| e.into_affine()).collect(),
     };
 
     Ok(Parameters {
         vk,
         h: Arc::new(h.into_iter().map(|e| e.into_affine()).collect()),
+        k: Arc::new(k.into_iter().map(|e| e.into_affine()).collect()),
         l: Arc::new(l.into_iter().map(|e| e.into_affine()).collect()),
 
         // Filter points at infinity away from A/B queries

@@ -123,8 +123,8 @@ impl SaplingProvingContext {
         };
 
         // Create proof
-        let proof =
-            create_random_proof(instance, proving_key, &mut rng).expect("proving should not fail");
+        let proof = create_random_proof(instance, proving_key, None, &mut rng)
+            .expect("proving should not fail");
 
         // Try to verify the proof:
         // Construct public input for circuit
@@ -224,8 +224,8 @@ impl SaplingProvingContext {
         };
 
         // Create proof
-        let proof =
-            create_random_proof(instance, proving_key, &mut rng).expect("proving should not fail");
+        let proof = create_random_proof(instance, proving_key, None, &mut rng)
+            .expect("proving should not fail");
 
         // Compute the actual value commitment
         let value_commitment: edwards::Point<Bls12, Unknown> = value_commitment.cm(params).into();

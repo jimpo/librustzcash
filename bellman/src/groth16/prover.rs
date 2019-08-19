@@ -21,8 +21,10 @@ use crate::multicore::Worker;
 fn eval<E: Engine>(
     lc: &LinearCombination<E>,
     mut input_density: Option<&mut DensityTracker>,
+    mut hybrid_density: Option<&mut DensityTracker>,
     mut aux_density: Option<&mut DensityTracker>,
     input_assignment: &[E::Fr],
+    hybrid_assignment: &[E::Fr],
     aux_assignment: &[E::Fr],
 ) -> E::Fr {
     let mut acc = E::Fr::zero();
@@ -34,6 +36,12 @@ fn eval<E: Engine>(
             Variable(Index::Input(i)) => {
                 tmp = input_assignment[i];
                 if let Some(ref mut v) = input_density {
+                    v.inc(i);
+                }
+            }
+            Variable(Index::Hybrid(i)) => {
+                tmp = hybrid_assignment[i];
+                if let Some(ref mut v) = hybrid_density {
                     v.inc(i);
                 }
             }
@@ -58,8 +66,10 @@ fn eval<E: Engine>(
 
 struct ProvingAssignment<E: Engine> {
     // Density of queries
+    a_hybrid_density: DensityTracker,
     a_aux_density: DensityTracker,
     b_input_density: DensityTracker,
+    b_hybrid_density: DensityTracker,
     b_aux_density: DensityTracker,
 
     // Evaluations of A, B, C polynomials
@@ -69,6 +79,7 @@ struct ProvingAssignment<E: Engine> {
 
     // Assignments of variables
     input_assignment: Vec<E::Fr>,
+    hybrid_assignment: Vec<E::Fr>,
     aux_assignment: Vec<E::Fr>,
 }
 
@@ -86,6 +97,19 @@ impl<E: Engine> ConstraintSystem<E> for ProvingAssignment<E> {
         self.b_aux_density.add_element();
 
         Ok(Variable(Index::Aux(self.aux_assignment.len() - 1)))
+    }
+
+    fn alloc_hybrid<F, A, AR>(&mut self, _: A, f: F) -> Result<Variable, SynthesisError>
+        where
+            F: FnOnce() -> Result<E::Fr, SynthesisError>,
+            A: FnOnce() -> AR,
+            AR: Into<String>,
+    {
+        self.hybrid_assignment.push(f()?);
+        self.a_hybrid_density.add_element();
+        self.b_hybrid_density.add_element();
+
+        Ok(Variable(Index::Hybrid(self.hybrid_assignment.len() - 1)))
     }
 
     fn alloc_input<F, A, AR>(&mut self, _: A, f: F) -> Result<Variable, SynthesisError>
@@ -118,15 +142,19 @@ impl<E: Engine> ConstraintSystem<E> for ProvingAssignment<E> {
             // because there are constraints of the
             // form x * 0 = 0 for each input.
             None,
+            Some(&mut self.a_hybrid_density),
             Some(&mut self.a_aux_density),
             &self.input_assignment,
+            &self.hybrid_assignment,
             &self.aux_assignment,
         )));
         self.b.push(Scalar(eval(
             &b,
             Some(&mut self.b_input_density),
+            Some(&mut self.b_hybrid_density),
             Some(&mut self.b_aux_density),
             &self.input_assignment,
+            &self.hybrid_assignment,
             &self.aux_assignment,
         )));
         self.c.push(Scalar(eval(
@@ -137,7 +165,9 @@ impl<E: Engine> ConstraintSystem<E> for ProvingAssignment<E> {
             // However, that query has full density.
             None,
             None,
+            None,
             &self.input_assignment,
+            &self.hybrid_assignment,
             &self.aux_assignment,
         )));
     }
@@ -162,6 +192,7 @@ impl<E: Engine> ConstraintSystem<E> for ProvingAssignment<E> {
 pub fn create_random_proof<E, C, R, P: ParameterSource<E>>(
     circuit: C,
     params: P,
+    q: Option<E::Fr>,
     rng: &mut R,
 ) -> Result<Proof<E>, SynthesisError>
 where
@@ -169,15 +200,17 @@ where
     C: Circuit<E>,
     R: RngCore,
 {
+	let q = q.unwrap_or_else(|| E::Fr::random(rng));
     let r = E::Fr::random(rng);
     let s = E::Fr::random(rng);
 
-    create_proof::<E, C, P>(circuit, params, r, s)
+    create_proof::<E, C, P>(circuit, params, q, r, s)
 }
 
 pub fn create_proof<E, C, P: ParameterSource<E>>(
     circuit: C,
     mut params: P,
+    q: E::Fr,
     r: E::Fr,
     s: E::Fr,
 ) -> Result<Proof<E>, SynthesisError>
@@ -186,13 +219,16 @@ where
     C: Circuit<E>,
 {
     let mut prover = ProvingAssignment {
+        a_hybrid_density: DensityTracker::new(),
         a_aux_density: DensityTracker::new(),
         b_input_density: DensityTracker::new(),
+        b_hybrid_density: DensityTracker::new(),
         b_aux_density: DensityTracker::new(),
         a: vec![],
         b: vec![],
         c: vec![],
         input_assignment: vec![],
+        hybrid_assignment: vec![],
         aux_assignment: vec![],
     };
 
@@ -242,6 +278,13 @@ where
             .map(|s| s.into_repr())
             .collect::<Vec<_>>(),
     );
+    let hybrid_assignment = Arc::new(
+        prover
+            .hybrid_assignment
+            .into_iter()
+            .map(|s| s.into_repr())
+            .collect::<Vec<_>>(),
+    );
     let aux_assignment = Arc::new(
         prover
             .aux_assignment
@@ -249,7 +292,14 @@ where
             .map(|s| s.into_repr())
             .collect::<Vec<_>>(),
     );
+    let has_hybrid = !hybrid_assignment.is_empty();
 
+    let k = multiexp(
+        &worker,
+        params.get_k(hybrid_assignment.len())?,
+        FullDensity,
+        hybrid_assignment.clone(),
+    );
     let l = multiexp(
         &worker,
         params.get_l(aux_assignment.len())?,
@@ -257,10 +307,13 @@ where
         aux_assignment.clone(),
     );
 
-    let a_aux_density_total = prover.a_aux_density.get_total_density();
+    let a_hybrid_density = Arc::new(prover.a_hybrid_density);
+    let a_hybrid_density_total = a_hybrid_density.get_total_density();
+    let a_aux_density = Arc::new(prover.a_aux_density);
+    let a_aux_density_total = a_aux_density.get_total_density();
 
-    let (a_inputs_source, a_aux_source) =
-        params.get_a(input_assignment.len(), a_aux_density_total)?;
+    let (a_inputs_source, a_hybrid_source, a_aux_source) =
+        params.get_a(input_assignment.len(), a_hybrid_density_total, a_aux_density_total)?;
 
     let a_inputs = multiexp(
         &worker,
@@ -268,26 +321,40 @@ where
         FullDensity,
         input_assignment.clone(),
     );
+    let a_hybrid = multiexp(
+        &worker,
+        a_hybrid_source,
+        a_hybrid_density,
+        hybrid_assignment.clone(),
+    );
     let a_aux = multiexp(
         &worker,
         a_aux_source,
-        Arc::new(prover.a_aux_density),
+        a_aux_density,
         aux_assignment.clone(),
     );
 
     let b_input_density = Arc::new(prover.b_input_density);
     let b_input_density_total = b_input_density.get_total_density();
+    let b_hybrid_density = Arc::new(prover.b_hybrid_density);
+    let b_hybrid_density_total = b_hybrid_density.get_total_density();
     let b_aux_density = Arc::new(prover.b_aux_density);
     let b_aux_density_total = b_aux_density.get_total_density();
 
-    let (b_g1_inputs_source, b_g1_aux_source) =
-        params.get_b_g1(b_input_density_total, b_aux_density_total)?;
+    let (b_g1_inputs_source, b_g1_hybrid_source, b_g1_aux_source) =
+        params.get_b_g1(b_input_density_total, b_hybrid_density_total, b_aux_density_total)?;
 
     let b_g1_inputs = multiexp(
         &worker,
         b_g1_inputs_source,
         b_input_density.clone(),
         input_assignment.clone(),
+    );
+    let b_g1_hybrid = multiexp(
+        &worker,
+        b_g1_hybrid_source,
+        b_hybrid_density.clone(),
+        hybrid_assignment.clone(),
     );
     let b_g1_aux = multiexp(
         &worker,
@@ -296,8 +363,8 @@ where
         aux_assignment.clone(),
     );
 
-    let (b_g2_inputs_source, b_g2_aux_source) =
-        params.get_b_g2(b_input_density_total, b_aux_density_total)?;
+    let (b_g2_inputs_source, b_g2_hybrid_source, b_g2_aux_source) =
+        params.get_b_g2(b_input_density_total, b_hybrid_density_total, b_aux_density_total)?;
 
     let b_g2_inputs = multiexp(
         &worker,
@@ -305,7 +372,18 @@ where
         b_input_density,
         input_assignment,
     );
-    let b_g2_aux = multiexp(&worker, b_g2_aux_source, b_aux_density, aux_assignment);
+    let b_g2_hybrid = multiexp(
+        &worker,
+        b_g2_hybrid_source,
+        b_hybrid_density,
+        hybrid_assignment,
+    );
+    let b_g2_aux = multiexp(
+        &worker,
+        b_g2_aux_source,
+        b_aux_density,
+        aux_assignment,
+    );
 
     if vk.delta_g1.is_zero() || vk.delta_g2.is_zero() {
         // If this element is zero, someone is trying to perform a
@@ -325,16 +403,22 @@ where
         g_c = vk.delta_g1.mul(rs);
         g_c.add_assign(&vk.alpha_g1.mul(s));
         g_c.add_assign(&vk.beta_g1.mul(r));
+        if has_hybrid {
+            g_c.sub_assign(&vk.theta_g1.mul(q));
+        }
     }
     let mut a_answer = a_inputs.wait()?;
+    a_answer.add_assign(&a_hybrid.wait()?);
     a_answer.add_assign(&a_aux.wait()?);
     g_a.add_assign(&a_answer);
     a_answer.mul_assign(s);
     g_c.add_assign(&a_answer);
 
     let mut b1_answer = b_g1_inputs.wait()?;
+    b1_answer.add_assign(&b_g1_hybrid.wait()?);
     b1_answer.add_assign(&b_g1_aux.wait()?);
     let mut b2_answer = b_g2_inputs.wait()?;
+    b2_answer.add_assign(&b_g2_hybrid.wait()?);
     b2_answer.add_assign(&b_g2_aux.wait()?);
 
     g_b.add_assign(&b2_answer);
@@ -343,9 +427,18 @@ where
     g_c.add_assign(&h.wait()?);
     g_c.add_assign(&l.wait()?);
 
+    let g_d = if has_hybrid {
+        let mut g_d = vk.delta_g1.mul(q);
+        g_d.add_assign(&k.wait()?);
+        Some(g_d)
+    } else {
+        None
+    };
+
     Ok(Proof {
         a: g_a.into_affine(),
         b: g_b.into_affine(),
         c: g_c.into_affine(),
+        d: g_d.map(|g_d| g_d.into_affine()),
     })
 }

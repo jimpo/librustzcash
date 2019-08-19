@@ -29,6 +29,7 @@ pub struct TestConstraintSystem<E: ScalarEngine> {
         String,
     )>,
     inputs: Vec<(E::Fr, String)>,
+    hybrid: Vec<(E::Fr, String)>,
     aux: Vec<(E::Fr, String)>,
 }
 
@@ -54,9 +55,14 @@ impl Ord for OrderedVariable {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self.0.get_unchecked(), other.0.get_unchecked()) {
             (Index::Input(ref a), Index::Input(ref b)) => a.cmp(b),
+            (Index::Hybrid(ref a), Index::Hybrid(ref b)) => a.cmp(b),
             (Index::Aux(ref a), Index::Aux(ref b)) => a.cmp(b),
+            (Index::Input(_), Index::Hybrid(_)) => Ordering::Less,
             (Index::Input(_), Index::Aux(_)) => Ordering::Less,
+            (Index::Hybrid(_), Index::Input(_)) => Ordering::Greater,
+            (Index::Hybrid(_), Index::Aux(_)) => Ordering::Less,
             (Index::Aux(_), Index::Input(_)) => Ordering::Greater,
+            (Index::Aux(_), Index::Hybrid(_)) => Ordering::Greater,
         }
     }
 }
@@ -97,6 +103,10 @@ fn hash_lc<E: ScalarEngine>(terms: &[(Variable, E::Fr)], h: &mut Blake2sState) {
                 buf[0] = b'I';
                 BigEndian::write_u64(&mut buf[1..9], i as u64);
             }
+            Index::Hybrid(i) => {
+                buf[0] = b'H';
+                BigEndian::write_u64(&mut buf[1..9], i as u64);
+            }
             Index::Aux(i) => {
                 buf[0] = b'A';
                 BigEndian::write_u64(&mut buf[1..9], i as u64);
@@ -112,6 +122,7 @@ fn hash_lc<E: ScalarEngine>(terms: &[(Variable, E::Fr)], h: &mut Blake2sState) {
 fn eval_lc<E: ScalarEngine>(
     terms: &[(Variable, E::Fr)],
     inputs: &[(E::Fr, String)],
+    hybrid: &[(E::Fr, String)],
     aux: &[(E::Fr, String)],
 ) -> E::Fr {
     let mut acc = E::Fr::zero();
@@ -119,6 +130,7 @@ fn eval_lc<E: ScalarEngine>(
     for &(var, ref coeff) in terms {
         let mut tmp = match var.get_unchecked() {
             Index::Input(index) => inputs[index].0,
+            Index::Hybrid(index) => hybrid[index].0,
             Index::Aux(index) => aux[index].0,
         };
 
@@ -142,6 +154,7 @@ impl<E: ScalarEngine> TestConstraintSystem<E> {
             current_namespace: vec![],
             constraints: vec![],
             inputs: vec![(E::Fr::one(), "ONE".into())],
+            hybrid: vec![],
             aux: vec![],
         }
     }
@@ -184,6 +197,9 @@ impl<E: ScalarEngine> TestConstraintSystem<E> {
                 match var.0.get_unchecked() {
                     Index::Input(i) => {
                         write!(s, "`{}`", &self.inputs[i].1).unwrap();
+                    }
+                    Index::Hybrid(i) => {
+                        write!(s, "`{}`", &self.hybrid[i].1).unwrap();
                     }
                     Index::Aux(i) => {
                         write!(s, "`{}`", &self.aux[i].1).unwrap();
@@ -240,9 +256,9 @@ impl<E: ScalarEngine> TestConstraintSystem<E> {
 
     pub fn which_is_unsatisfied(&self) -> Option<&str> {
         for &(ref a, ref b, ref c, ref path) in &self.constraints {
-            let mut a = eval_lc::<E>(a.as_ref(), &self.inputs, &self.aux);
-            let b = eval_lc::<E>(b.as_ref(), &self.inputs, &self.aux);
-            let c = eval_lc::<E>(c.as_ref(), &self.inputs, &self.aux);
+            let mut a = eval_lc::<E>(a.as_ref(), &self.inputs, &self.hybrid, &self.aux);
+            let b = eval_lc::<E>(b.as_ref(), &self.inputs, &self.hybrid, &self.aux);
+            let c = eval_lc::<E>(c.as_ref(), &self.inputs, &self.hybrid, &self.aux);
 
             a.mul_assign(&b);
 
@@ -266,6 +282,7 @@ impl<E: ScalarEngine> TestConstraintSystem<E> {
         match self.named_objects.get(path) {
             Some(&NamedObject::Var(ref v)) => match v.get_unchecked() {
                 Index::Input(index) => self.inputs[index].0 = to,
+                Index::Hybrid(index) => self.hybrid[index].0 = to,
                 Index::Aux(index) => self.aux[index].0 = to,
             },
             Some(e) => panic!(
@@ -304,6 +321,7 @@ impl<E: ScalarEngine> TestConstraintSystem<E> {
         match self.named_objects.get(path) {
             Some(&NamedObject::Var(ref v)) => match v.get_unchecked() {
                 Index::Input(index) => self.inputs[index].0,
+                Index::Hybrid(index) => self.hybrid[index].0,
                 Index::Aux(index) => self.aux[index].0,
             },
             Some(e) => panic!(
@@ -356,6 +374,21 @@ impl<E: ScalarEngine> ConstraintSystem<E> for TestConstraintSystem<E> {
         let path = compute_path(&self.current_namespace, annotation().into());
         self.aux.push((f()?, path.clone()));
         let var = Variable::new_unchecked(Index::Aux(index));
+        self.set_named_obj(path, NamedObject::Var(var));
+
+        Ok(var)
+    }
+
+    fn alloc_hybrid<F, A, AR>(&mut self, annotation: A, f: F) -> Result<Variable, SynthesisError>
+        where
+            F: FnOnce() -> Result<E::Fr, SynthesisError>,
+            A: FnOnce() -> AR,
+            AR: Into<String>,
+    {
+        let index = self.hybrid.len();
+        let path = compute_path(&self.current_namespace, annotation().into());
+        self.hybrid.push((f()?, path.clone()));
+        let var = Variable::new_unchecked(Index::Hybrid(index));
         self.set_named_obj(path, NamedObject::Var(var));
 
         Ok(var)

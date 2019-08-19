@@ -85,6 +85,7 @@ fn main() {
                 anchor: Some(anchor),
             },
             &groth_params,
+            None,
             rng,
         )
         .unwrap();

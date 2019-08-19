@@ -867,7 +867,8 @@ pub extern "system" fn librustzcash_sprout_prove(
     // Initialize secure RNG
     let mut rng = OsRng;
 
-    let proof = create_random_proof(js, &params, &mut rng).expect("proving should not fail");
+    let proof = create_random_proof(js, &params, None, &mut rng)
+        .expect("proving should not fail");
 
     proof
         .write(&mut (unsafe { &mut *proof_out })[..])

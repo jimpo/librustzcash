@@ -81,6 +81,15 @@ impl<E: ScalarEngine, CS: ConstraintSystem<E>> ConstraintSystem<E> for MultiEq<E
         self.cs.alloc(annotation, f)
     }
 
+    fn alloc_hybrid<F, A, AR>(&mut self, annotation: A, f: F) -> Result<Variable, SynthesisError>
+        where
+            F: FnOnce() -> Result<E::Fr, SynthesisError>,
+            A: FnOnce() -> AR,
+            AR: Into<String>,
+    {
+        self.cs.alloc_hybrid(annotation, f)
+    }
+
     fn alloc_input<F, A, AR>(&mut self, annotation: A, f: F) -> Result<Variable, SynthesisError>
     where
         F: FnOnce() -> Result<E::Fr, SynthesisError>,

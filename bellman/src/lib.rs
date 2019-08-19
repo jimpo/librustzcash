@@ -58,6 +58,7 @@ impl Variable {
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum Index {
     Input(usize),
+    Hybrid(usize),
     Aux(usize),
 }
 
@@ -245,6 +246,16 @@ pub trait ConstraintSystem<E: ScalarEngine>: Sized {
         A: FnOnce() -> AR,
         AR: Into<String>;
 
+    /// Allocate a hybrid variable in the constraint system. The provided function is used to
+    /// determine the assignment of the variable. The given `annotation` function is invoked
+    /// in testing contexts in order to derive a unique name for this variable in the current
+    /// namespace.
+    fn alloc_hybrid<F, A, AR>(&mut self, annotation: A, f: F) -> Result<Variable, SynthesisError>
+        where
+            F: FnOnce() -> Result<E::Fr, SynthesisError>,
+            A: FnOnce() -> AR,
+            AR: Into<String>;
+
     /// Allocate a public variable in the constraint system. The provided function is used to
     /// determine the assignment of the variable.
     fn alloc_input<F, A, AR>(&mut self, annotation: A, f: F) -> Result<Variable, SynthesisError>
@@ -310,6 +321,15 @@ impl<'cs, E: ScalarEngine, CS: ConstraintSystem<E>> ConstraintSystem<E> for Name
         self.0.alloc(annotation, f)
     }
 
+    fn alloc_hybrid<F, A, AR>(&mut self, annotation: A, f: F) -> Result<Variable, SynthesisError>
+        where
+            F: FnOnce() -> Result<E::Fr, SynthesisError>,
+            A: FnOnce() -> AR,
+            AR: Into<String>,
+    {
+        self.0.alloc_hybrid(annotation, f)
+    }
+
     fn alloc_input<F, A, AR>(&mut self, annotation: A, f: F) -> Result<Variable, SynthesisError>
     where
         F: FnOnce() -> Result<E::Fr, SynthesisError>,
@@ -373,6 +393,15 @@ impl<'cs, E: ScalarEngine, CS: ConstraintSystem<E>> ConstraintSystem<E> for &'cs
         AR: Into<String>,
     {
         (**self).alloc(annotation, f)
+    }
+
+    fn alloc_hybrid<F, A, AR>(&mut self, annotation: A, f: F) -> Result<Variable, SynthesisError>
+        where
+            F: FnOnce() -> Result<E::Fr, SynthesisError>,
+            A: FnOnce() -> AR,
+            AR: Into<String>,
+    {
+        (**self).alloc_hybrid(annotation, f)
     }
 
     fn alloc_input<F, A, AR>(&mut self, annotation: A, f: F) -> Result<Variable, SynthesisError>
